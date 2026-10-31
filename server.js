@@ -118,6 +118,117 @@ const {
 } = require('./cuefield/feedback-log');
 const { planCuefieldTransitionFromCache } = require('./cuefield/mineradio-bridge');
 
+// ---------- LX 外部音源（移植自 mineradio-lx fork 的 services/lx-source-host.js） ----------
+const lxSourceHost = require('./services/lx-source-host');
+const lxSearch = require('./services/lx-search');
+try {
+  const lxElectronNet = require('electron').net;
+  if (lxElectronNet && typeof lxElectronNet.fetch === 'function') {
+    lxSearch.setFetchImplementation(lxElectronNet.fetch.bind(lxElectronNet));
+  }
+} catch (_lxNetErr) {}
+
+const LX_FALLBACK_TIMEOUT_MS = 15000;
+const LX_FALLBACK_ENABLED = String(process.env.MINERADIO_LX_FALLBACK || '1') !== '0';
+const LX_FALLBACK_TRIAL_ENABLED = String(process.env.MINERADIO_LX_FALLBACK_TRIAL || '') === '1';
+const LX_FALLBACK_RETRY_AFTER_MS = 30000;
+const LX_FALLBACK_SOURCE_BY_PROVIDER = Object.freeze({ netease: 'wy', qq: 'tx', kugou: 'kg' });
+const LX_QUALITY_ALIASES = Object.freeze({
+  standard: '128k', higher: '320k', exhigh: '320k', lossless: 'flac', hires: 'flac24bit',
+  jymaster: 'master', jyeffect: '320k', sky: '320k', dolby: '320k', atmos: 'atmos_plus',
+});
+const lxFallbackFailures = new Map();
+
+function lxAudioProxyUrl(originalUrl) {
+  if (!originalUrl) return '';
+  return '/api/audio?url=' + encodeURIComponent(String(originalUrl));
+}
+function lxFallbackQuality(quality) {
+  const raw = String(quality || '').trim();
+  return LX_QUALITY_ALIASES[raw.toLowerCase()] || raw;
+}
+function lxNeedsPlaybackFallback(info) {
+  if (!info || typeof info !== 'object') return false;
+  if (!info.url) return true;
+  if (info.playable === false) return true;
+  if (info.trial === true) return LX_FALLBACK_TRIAL_ENABLED;
+  return false;
+}
+function lxResolveWithTimeout(source, musicInfo, quality, options) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('LX_FALLBACK_TIMEOUT'));
+    }, LX_FALLBACK_TIMEOUT_MS);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    Promise.resolve()
+      .then(() => lxSourceHost.resolveMusicUrl(source, musicInfo, quality, options))
+      .then(value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      }, err => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+async function withLxPlaybackFallback(info, ctx) {
+  const context = ctx || {};
+  if (!LX_FALLBACK_ENABLED) return info;
+  const key = [context.provider, context.id || '', context.quality || ''].join('|');
+  try {
+    const lxSource = LX_FALLBACK_SOURCE_BY_PROVIDER[context.provider];
+    if (!lxSource || !lxNeedsPlaybackFallback(info)) return info;
+    if ((lxFallbackFailures.get(key) || 0) > Date.now()) return info;
+    const resolved = await lxResolveWithTimeout(lxSource, {
+      source: lxSource,
+      id: context.id || '',
+      songmid: context.id || '',
+      hash: context.id || '',
+      name: context.name || '',
+      singer: context.singer || '',
+      albumName: context.album || '',
+    }, lxFallbackQuality(context.quality), { maxResolvers: 6 });
+    const url = resolved && resolved.url ? String(resolved.url) : '';
+    if (!url) throw new Error('LX_SOURCE_EMPTY_URL');
+    lxFallbackFailures.delete(key);
+    const merged = Object.assign({}, info, {
+      url,
+      playable: true,
+      trial: false,
+      playbackSource: 'lx',
+      lxResolver: (resolved && (resolved.resolver || resolved.name)) || '',
+      lxQuality: (resolved && resolved.quality) || '',
+      lxOriginal: {
+        url: (info && info.url) || '',
+        trial: !!(info && info.trial),
+        playable: info && info.playable,
+        reason: (info && (info.reason || info.error)) || '',
+      },
+    });
+    if (info && typeof info === 'object' && info.error) merged.error = null;
+    return merged;
+  } catch (err) {
+    if (context.id) lxFallbackFailures.set(key, Date.now() + LX_FALLBACK_RETRY_AFTER_MS);
+    console.warn('[LXFallback]', context.provider || '', context.id || '', err && err.message);
+    return info;
+  }
+}
+
+// 预热：首次 LX 解析冷启动可达 12s+，进程启动后主动初始化一次宿主（失败静默）
+if (LX_FALLBACK_ENABLED) {
+  const lxWarmupTimer = setTimeout(() => {
+    Promise.resolve().then(() => lxSourceHost.status()).catch(() => {});
+  }, 5000);
+  if (lxWarmupTimer && typeof lxWarmupTimer.unref === 'function') lxWarmupTimer.unref();
+}
+
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const LOGIN_EASTER_EGG_GATE_FILE = String(process.env.MINERADIO_LOGIN_EASTER_EGG_GATE_FILE || '');
@@ -5575,7 +5686,11 @@ const server = http.createServer(async (req, res) => {
         privilege: url.searchParams.get('privilege') || url.searchParams.get('mediaPrivilege') || url.searchParams.get('media_privilege') || '',
         fee: url.searchParams.get('fee') || '',
       }, kugouCookie);
-      sendJSON(res, info);
+      sendJSON(res, await withLxPlaybackFallback(info, {
+        provider: 'kugou',
+        id: url.searchParams.get('hash') || url.searchParams.get('id') || '',
+        quality: url.searchParams.get('quality') || '',
+      }));
     } catch (err) {
       console.error('[KugouSongUrl]', err);
       sendJSON(res, { provider: 'kugou', url: '', playable: false, error: err.message }, 500);
@@ -5720,7 +5835,12 @@ const server = http.createServer(async (req, res) => {
         privilege: url.searchParams.get('privilege') || url.searchParams.get('mediaPrivilege') || url.searchParams.get('media_privilege') || '',
         fee: url.searchParams.get('fee') || ''
       };
-      const info = await handleQQSongUrl(mid, mediaMid, quality, playbackHints);
+      const info = await withLxPlaybackFallback(await handleQQSongUrl(mid, mediaMid, quality, playbackHints), {
+        provider: 'qq',
+        id: mid,
+        mediaMid,
+        quality,
+      });
       sendJSON(res, info);
     } catch (err) {
       console.error('[QQSongUrl]', err);
@@ -6075,7 +6195,14 @@ const server = http.createServer(async (req, res) => {
         skipDirect: url.searchParams.get('skipDirect') === '1',
       };
       const loginInfo = await getPlaybackLoginInfo();
-      const info = await handleSongUrl(sid, loginInfo, quality, matchHints);
+      const info = await withLxPlaybackFallback(await handleSongUrl(sid, loginInfo, quality, matchHints), {
+        provider: 'netease',
+        id: sid,
+        quality,
+        name: matchHints.name,
+        singer: matchHints.artist,
+        album: matchHints.album,
+      });
       sendJSON(res, {
         ...info,
         loggedIn: loginInfo.loggedIn,
@@ -6633,6 +6760,151 @@ const server = http.createServer(async (req, res) => {
       while (true) { const c = await reader.read(); if (c.done) break; res.write(c.value); }
       res.end();
     } catch (err) { console.error('[Cover]', err); res.writeHead(500); res.end(); }
+    return;
+  }
+
+  // ---------- LX 外部音源（移植自 mineradio-lx fork 的 /api/lx-source/*） ----------
+  if (pn === '/api/lx-source/status') {
+    try {
+      sendJSON(res, await lxSourceHost.status());
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_UNAVAILABLE' }, 503);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/resolve') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const source = String(body.source || '').toLowerCase();
+      const musicInfo = body.musicInfo && typeof body.musicInfo === 'object' ? body.musicInfo : {};
+      const result = await lxSourceHost.resolveMusicUrl(source, musicInfo, String(body.quality || ''), {
+        excludeResolvers: Array.isArray(body.excludeResolvers) ? body.excludeResolvers : [],
+        maxResolvers: Math.max(1, Math.min(8, Number(body.maxResolvers) || 6)),
+      });
+      sendJSON(res, { ok: true, source, ...result, proxyUrl: lxAudioProxyUrl(result && result.url) });
+    } catch (err) {
+      console.warn('[LXSourceResolve]', err.message);
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_RESOLVE_FAILED' }, 502);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/lyric') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const source = String(body.source || '').toLowerCase();
+      const musicInfo = body.musicInfo && typeof body.musicInfo === 'object' ? body.musicInfo : {};
+      const lyrics = await lxSourceHost.resolveLyrics(source, musicInfo);
+      sendJSON(res, { ok: true, source, ...lyrics });
+    } catch (err) {
+      console.warn('[LXSourceLyric]', err.message);
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_LYRIC_FAILED' }, 502);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/import') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const result = body.url
+        ? await lxSourceHost.importSourceUrl(body.url)
+        : await lxSourceHost.importSource(body.script, body.fileName);
+      sendJSON(res, result);
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_IMPORT_FAILED' }, 400);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/select') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      sendJSON(res, await lxSourceHost.selectSource(body.id));
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_SELECT_FAILED' }, 400);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/toggle') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const ids = Array.isArray(body.ids) ? body.ids : body.id;
+      sendJSON(res, await lxSourceHost.setSourcesEnabled(ids, body.enabled !== false));
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_TOGGLE_FAILED' }, 400);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/check') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const ids = Array.isArray(body.ids) ? body.ids : body.id;
+      sendJSON(res, await lxSourceHost.checkSources(ids));
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_CHECK_FAILED' }, 400);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/delete') {
+    if (req.method !== 'POST') {
+      sendJSON(res, { ok: false, error: 'METHOD_NOT_ALLOWED' }, 405);
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      sendJSON(res, Array.isArray(body.ids)
+        ? await lxSourceHost.deleteSources(body.ids)
+        : await lxSourceHost.deleteSource(body.id));
+    } catch (err) {
+      sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_DELETE_FAILED' }, 400);
+    }
+    return;
+  }
+
+  if (pn === '/api/lx-source/search') {
+    try {
+      const result = await lxSearch.searchAll(url.searchParams.get('q'), {
+        sources: url.searchParams.get('sources'),
+        limit: url.searchParams.get('limit'),
+      });
+      sendJSON(res, result, result.ok ? 200 : 502);
+    } catch (err) {
+      sendJSON(res, { ok: false, songs: [], error: err.message || 'LX_SEARCH_FAILED' }, 502);
+    }
+    return;
+  }
+
+  // 落雪本机联动：2.2.0 不引入 LX Desktop 依赖，统一回报未安装。
+  if (pn === '/api/lx/status' || pn === '/api/lx/playlists' || pn === '/api/lx/lyrics' || pn === '/api/lx/control') {
+    sendJSON(res, { ok: false, connected: false, error: 'LX_DESKTOP_NOT_INSTALLED' }, 503);
     return;
   }
 
