@@ -139,6 +139,38 @@ const LX_QUALITY_ALIASES = Object.freeze({
 });
 const lxFallbackFailures = new Map();
 
+// 「优先用外部音源」开关：默认开启（切换到外部源即默认走外部），可被环境变量或配置文件关闭。
+// 配置：%APPDATA%\Mineradio\sources\prefer-external.json  { "enabled": true|false }
+const LX_PREFER_FILE = path.join(process.env.APPDATA || '', 'Mineradio', 'sources', 'prefer-external.json');
+const LX_PREFER_BUDGET_MS = Number(process.env.MINERADIO_LX_PREFER_BUDGET_MS || 3500);
+let lxPreferCached = null;
+let lxPreferCachedMtime = 0;
+
+function lxPreferEnabled() {
+  const mode = String(process.env.MINERADIO_LX_MODE || '').toLowerCase();
+  if (mode === 'prefer') return true;
+  if (mode === 'fallback') return false;
+  try {
+    const st = fs.statSync(LX_PREFER_FILE);
+    if (lxPreferCached === null || st.mtimeMs !== lxPreferCachedMtime) {
+      const raw = JSON.parse(fs.readFileSync(LX_PREFER_FILE, 'utf8'));
+      lxPreferCached = !!(raw && raw.enabled === true);
+      lxPreferCachedMtime = st.mtimeMs;
+    }
+    return lxPreferCached === true;
+  } catch (_) {
+    return lxPreferCached === null ? true : lxPreferCached === true;
+  }
+}
+function lxSetPrefer(enabled) {
+  const next = enabled === true;
+  fs.mkdirSync(path.dirname(LX_PREFER_FILE), { recursive: true });
+  fs.writeFileSync(LX_PREFER_FILE, JSON.stringify({ enabled: next, updatedAt: new Date().toISOString() }, null, 2), 'utf8');
+  lxPreferCached = next;
+  try { lxPreferCachedMtime = fs.statSync(LX_PREFER_FILE).mtimeMs; } catch (_) { lxPreferCachedMtime = 0; }
+  return next;
+}
+
 function lxAudioProxyUrl(originalUrl) {
   if (!originalUrl) return '';
   return '/api/audio?url=' + encodeURIComponent(String(originalUrl));
@@ -154,14 +186,14 @@ function lxNeedsPlaybackFallback(info) {
   if (info.trial === true) return LX_FALLBACK_TRIAL_ENABLED;
   return false;
 }
-function lxResolveWithTimeout(source, musicInfo, quality, options) {
+function lxResolveWithTimeout(source, musicInfo, quality, options, timeoutMs) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       reject(new Error('LX_FALLBACK_TIMEOUT'));
-    }, LX_FALLBACK_TIMEOUT_MS);
+    }, Number(timeoutMs) > 0 ? Number(timeoutMs) : LX_FALLBACK_TIMEOUT_MS);
     if (timer && typeof timer.unref === 'function') timer.unref();
     Promise.resolve()
       .then(() => lxSourceHost.resolveMusicUrl(source, musicInfo, quality, options))
@@ -184,7 +216,10 @@ async function withLxPlaybackFallback(info, ctx) {
   const key = [context.provider, context.id || '', context.quality || ''].join('|');
   try {
     const lxSource = LX_FALLBACK_SOURCE_BY_PROVIDER[context.provider];
-    if (!lxSource || !lxNeedsPlaybackFallback(info)) return info;
+    if (!lxSource) return info;
+    // prefer = 优先走外部音源（默认）；非 prefer 才退化成"仅平台不可播时兜底"
+    const prefer = lxPreferEnabled();
+    if (!prefer && !lxNeedsPlaybackFallback(info)) return info;
     if ((lxFallbackFailures.get(key) || 0) > Date.now()) return info;
     const resolved = await lxResolveWithTimeout(lxSource, {
       source: lxSource,
@@ -194,7 +229,7 @@ async function withLxPlaybackFallback(info, ctx) {
       name: context.name || '',
       singer: context.singer || '',
       albumName: context.album || '',
-    }, lxFallbackQuality(context.quality), { maxResolvers: 6 });
+    }, lxFallbackQuality(context.quality), { maxResolvers: 6 }, prefer ? LX_PREFER_BUDGET_MS : LX_FALLBACK_TIMEOUT_MS);
     const url = resolved && resolved.url ? String(resolved.url) : '';
     if (!url) throw new Error('LX_SOURCE_EMPTY_URL');
     lxFallbackFailures.delete(key);
@@ -203,6 +238,7 @@ async function withLxPlaybackFallback(info, ctx) {
       playable: true,
       trial: false,
       playbackSource: 'lx',
+      lxPrefer: prefer === true,
       lxResolver: (resolved && (resolved.resolver || resolved.name)) || '',
       lxQuality: (resolved && resolved.quality) || '',
       lxOriginal: {
@@ -6766,10 +6802,30 @@ const server = http.createServer(async (req, res) => {
   // ---------- LX 外部音源（移植自 mineradio-lx fork 的 /api/lx-source/*） ----------
   if (pn === '/api/lx-source/status') {
     try {
-      sendJSON(res, await lxSourceHost.status());
+      const status = await lxSourceHost.status();
+      sendJSON(res, Object.assign({}, status, {
+        preferExternal: lxPreferEnabled(),
+        preferBudgetMs: LX_PREFER_BUDGET_MS,
+      }));
     } catch (err) {
       sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_UNAVAILABLE' }, 503);
     }
+    return;
+  }
+
+  // 优先外部音源开关：GET 读，POST { enabled } 写（持久化到 sources/prefer-external.json）
+  if (pn === '/api/lx-source/prefer') {
+    if (req.method === 'POST') {
+      try {
+        const body = await readRequestBody(req);
+        const enabled = body.enabled === true || String(body.enabled) === '1' || String(body.enabled) === 'true';
+        sendJSON(res, { ok: true, preferExternal: lxSetPrefer(enabled), preferBudgetMs: LX_PREFER_BUDGET_MS });
+      } catch (err) {
+        sendJSON(res, { ok: false, error: err.message || 'LX_PREFER_WRITE_FAILED' }, 400);
+      }
+      return;
+    }
+    sendJSON(res, { ok: true, preferExternal: lxPreferEnabled(), preferBudgetMs: LX_PREFER_BUDGET_MS });
     return;
   }
 
