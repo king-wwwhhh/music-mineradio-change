@@ -3,7 +3,7 @@
 (function () {
   'use strict';
   var API = '/api/lx-source';
-  var state = { loading: false, status: null, busy: false, message: '' };
+  var state = { loading: false, status: null, busy: false, message: '', stats: { total: 0, lx: 0, miss: 0 }, last: null };
 
   function esc(v) {
     return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
@@ -63,7 +63,12 @@
       '.lxsrc-import input[type=file]{color:#aab4c2;font-size:11.5px;max-width:190px}',
       '#lxsrc-status{padding:0 18px 13px;color:#8b95a5;font-size:11.5px;min-height:16px;letter-spacing:.02em}',
       '#lxsrc-status.err{color:#ffb199}',
-      '#lxsrc-status.ok{color:#9cffdf}'
+      '#lxsrc-status.ok{color:#9cffdf}',
+      '#lxsrc-stats{padding:0 18px 14px;color:#7f8a99;font-size:11px;letter-spacing:.02em}',
+      '#lxsrc-badge{position:fixed;right:18px;bottom:146px;z-index:61;display:none;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;border:1px solid rgba(156,255,223,.45);background:rgba(10,18,16,.86);backdrop-filter:blur(14px);color:#c9ffe9;font-size:12px;letter-spacing:.02em;box-shadow:0 10px 30px rgba(0,0,0,.5)}',
+      '#lxsrc-badge.show{display:flex}',
+      '#lxsrc-badge.miss{border-color:rgba(255,143,107,.5);color:#ffcdbd;background:rgba(24,14,12,.86)}',
+      '#lxsrc-badge i{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor;not-italic:1}'
     ].join('\n');
     var el = document.createElement('style');
     el.id = 'lxsrc-style';
@@ -86,10 +91,54 @@
     if (document.getElementById('lxsrc-mask')) return;
     var mask = document.createElement('div');
     mask.id = 'lxsrc-mask';
-    mask.innerHTML = '<div id="lxsrc-dialog"><header><div><b>外部音源</b><small id="lxsrc-sub">第三方 LX 自定义源</small></div><button id="lxsrc-close" type="button" aria-label="关闭">×</button></header><div class="lxsrc-body" id="lxsrc-list"></div><div id="lxsrc-status"></div></div>';
+    mask.innerHTML = '<div id="lxsrc-dialog"><header><div><b>外部音源</b><small id="lxsrc-sub">第三方 LX 自定义源</small></div><button id="lxsrc-close" type="button" aria-label="关闭">×</button></header><div class="lxsrc-body" id="lxsrc-list"></div><div id="lxsrc-stats"></div><div id="lxsrc-status"></div></div>';
     document.body.appendChild(mask);
     mask.addEventListener('click', function (e) { if (e.target === mask) closeLxSourceManager(); });
     mask.querySelector('#lxsrc-close').addEventListener('click', closeLxSourceManager);
+  }
+
+  var badgeTimer = null;
+  function showBadge(text, miss) {
+    var el = document.getElementById('lxsrc-badge');
+    if (!el) return;
+    el.innerHTML = '<i></i><span>' + esc(text) + '</span>';
+    el.className = 'show' + (miss ? ' miss' : '');
+    if (badgeTimer) clearTimeout(badgeTimer);
+    badgeTimer = setTimeout(function () { el.className = ''; }, 5200);
+  }
+
+  // 取流时标记：/api/song/url 的响应里带 playbackSource 就说明这次真的走了外部源
+  function installApiHook() {
+    if (typeof window.apiJson !== 'function' || window.apiJson.__lxWrapped) return !!window.apiJson;
+    var orig = window.apiJson;
+    var wrapped = function (url, opts) {
+      return orig.apply(this, arguments).then(function (res) {
+        try {
+          if (typeof url === 'string' && url.indexOf('/api/song/url') >= 0 && res && typeof res === 'object') {
+            state.stats.total += 1;
+            state.last = res;
+            if (res.playbackSource === 'lx') {
+              state.stats.lx += 1;
+              showBadge('外部源 · ' + (res.lxResolver || 'lx') + (res.lxQuality ? ' · ' + res.lxQuality : ''), false);
+            } else if (res.lxPreferTried) {
+              state.stats.miss += 1;
+              showBadge('外部源未命中，已回退平台 · ' + (res.lxError || ''), true);
+            }
+            var statsEl = document.getElementById('lxsrc-stats');
+            if (statsEl) statsEl.textContent = statsText();
+          }
+        } catch (_) {}
+        return res;
+      });
+    };
+    wrapped.__lxWrapped = true;
+    window.apiJson = wrapped;
+    return true;
+  }
+  function statsText() {
+    var s = state.stats;
+    if (!s.total) return '本次会话：还没有取流记录（播一首歌就会出现）';
+    return '本次会话：取流 ' + s.total + ' 次 · 走外部源 ' + s.lx + ' 次 · 回退平台 ' + s.miss + ' 次';
   }
 
   function setStatus(text, mode) {
@@ -133,6 +182,8 @@
       '<div class="line" style="margin-top:8px"><input id="lxsrc-url" type="text" placeholder="或填脚本 URL（https://…/latest.js）"><button class="lxsrc-btn" id="lxsrc-url-go" type="button">导入链接</button></div></div>';
     list.innerHTML = html;
     bindList();
+    var statsEl = document.getElementById('lxsrc-stats');
+    if (statsEl) statsEl.textContent = statsText();
   }
 
   function bindList() {
@@ -224,6 +275,18 @@
   function boot() {
     injectStyle();
     ensureEntry();
+    if (!document.getElementById('lxsrc-badge')) {
+      var badge = document.createElement('div');
+      badge.id = 'lxsrc-badge';
+      document.body.appendChild(badge);
+    }
+    if (!installApiHook()) {
+      var tries = 0;
+      var t = setInterval(function () {
+        tries += 1;
+        if (installApiHook() || tries > 20) clearInterval(t);
+      }, 400);
+    }
     apiJson('/status?t=' + Date.now()).then(function (s) {
       var entry = document.getElementById('lxsrc-entry');
       if (entry) entry.classList.toggle('off', !(s && s.preferExternal));

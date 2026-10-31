@@ -214,11 +214,11 @@ async function withLxPlaybackFallback(info, ctx) {
   const context = ctx || {};
   if (!LX_FALLBACK_ENABLED) return info;
   const key = [context.provider, context.id || '', context.quality || ''].join('|');
+  // prefer = 优先走外部音源（默认）；非 prefer 才退化成"仅平台不可播时兜底"
+  const prefer = lxPreferEnabled();
   try {
     const lxSource = LX_FALLBACK_SOURCE_BY_PROVIDER[context.provider];
     if (!lxSource) return info;
-    // prefer = 优先走外部音源（默认）；非 prefer 才退化成"仅平台不可播时兜底"
-    const prefer = lxPreferEnabled();
     if (!prefer && !lxNeedsPlaybackFallback(info)) return info;
     if ((lxFallbackFailures.get(key) || 0) > Date.now()) return info;
     const resolved = await lxResolveWithTimeout(lxSource, {
@@ -253,6 +253,10 @@ async function withLxPlaybackFallback(info, ctx) {
   } catch (err) {
     if (context.id) lxFallbackFailures.set(key, Date.now() + LX_FALLBACK_RETRY_AFTER_MS);
     console.warn('[LXFallback]', context.provider || '', context.id || '', err && err.message);
+    // 让前端能区分"没开外部源"与"开了但这次没取到"，不改变其它字段
+    if (info && typeof info === 'object' && prefer) {
+      return Object.assign({}, info, { lxPreferTried: true, lxError: String((err && err.message) || 'LX_FALLBACK_FAILED') });
+    }
     return info;
   }
 }
