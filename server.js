@@ -143,6 +143,18 @@ const lxFallbackFailures = new Map();
 // 配置：%APPDATA%\Mineradio\sources\prefer-external.json  { "enabled": true|false }
 const LX_PREFER_FILE = path.join(process.env.APPDATA || '', 'Mineradio', 'sources', 'prefer-external.json');
 const LX_PREFER_BUDGET_MS = Number(process.env.MINERADIO_LX_PREFER_BUDGET_MS || 3500);
+// 高码率档位保护：第三方源普遍拿不到平台级（SVIP/无损/Hi-Res）码率，
+// 这些档位默认仍走平台，只有平台确实不可播时才用外部源。MINERADIO_LX_PREFER_HIGH=all 可关闭保护。
+const LX_HIGH_TIERS = new Set(['lossless', 'hires', 'jymaster', 'atmos', 'master', 'flac', 'flac24bit', 'atmos_plus', 'sky', 'dolby', 'studio', 'svip']);
+function lxPreferHighMode() {
+  return String(process.env.MINERADIO_LX_PREFER_HIGH || 'protect').toLowerCase() === 'all' ? 'all' : 'protect';
+}
+function lxPreferApplies(quality) {
+  if (lxPreferHighMode() === 'all') return true;
+  const raw = String(quality || '').trim().toLowerCase();
+  if (!raw) return true;
+  return !LX_HIGH_TIERS.has(raw);
+}
 let lxPreferCached = null;
 let lxPreferCachedMtime = 0;
 
@@ -215,7 +227,7 @@ async function withLxPlaybackFallback(info, ctx) {
   if (!LX_FALLBACK_ENABLED) return info;
   const key = [context.provider, context.id || '', context.quality || ''].join('|');
   // prefer = 优先走外部音源（默认）；非 prefer 才退化成"仅平台不可播时兜底"
-  const prefer = lxPreferEnabled();
+  const prefer = lxPreferEnabled() && lxPreferApplies(context.quality);
   try {
     const lxSource = LX_FALLBACK_SOURCE_BY_PROVIDER[context.provider];
     if (!lxSource) return info;
@@ -6810,6 +6822,7 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, Object.assign({}, status, {
         preferExternal: lxPreferEnabled(),
         preferBudgetMs: LX_PREFER_BUDGET_MS,
+        preferHighMode: lxPreferHighMode(),
       }));
     } catch (err) {
       sendJSON(res, { ok: false, error: err.message || 'LX_SOURCE_UNAVAILABLE' }, 503);
