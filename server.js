@@ -147,7 +147,8 @@ const LX_PREFER_BUDGET_MS = Number(process.env.MINERADIO_LX_PREFER_BUDGET_MS || 
 // 这些档位默认仍走平台，只有平台确实不可播时才用外部源。MINERADIO_LX_PREFER_HIGH=all 可关闭保护。
 const LX_HIGH_TIERS = new Set(['lossless', 'hires', 'jymaster', 'atmos', 'master', 'flac', 'flac24bit', 'atmos_plus', 'sky', 'dolby', 'studio', 'svip']);
 function lxPreferHighMode() {
-  return String(process.env.MINERADIO_LX_PREFER_HIGH || 'protect').toLowerCase() === 'all' ? 'all' : 'protect';
+  // 'all'（默认）= 所有档位都优先外部；'protect' = 高码率档位让给平台
+  return String(process.env.MINERADIO_LX_PREFER_HIGH || 'all').toLowerCase() === 'protect' ? 'protect' : 'all';
 }
 function lxPreferApplies(quality) {
   if (lxPreferHighMode() === 'all') return true;
